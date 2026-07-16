@@ -198,6 +198,11 @@ class SoftVizCache:
         self.edit_vw_sig = None
         # obj.name -> selected vert indices; used for proportional idle fast path (skip bmesh).
         self.prop_sel_by_obj = {}
+        # Position fingerprint cached per vert_weights list identity (skip rehash on idle redraws).
+        self.vw_fp = None
+        self.vw_fp_list = None
+        # Monotonic token used instead of hashing during modal drags (batch rebuilds anyway).
+        self.batch_seq = 0
 
 VIZ_CACHE = SoftVizCache()
 
@@ -237,6 +242,8 @@ def remove_draw_handler():
     VIZ_CACHE.edit_vw_list = None
     VIZ_CACHE.edit_vw_sig = None
     VIZ_CACHE.prop_sel_by_obj = {}
+    VIZ_CACHE.vw_fp = None
+    VIZ_CACHE.vw_fp_list = None
     VIZ_CACHE.draw_error_logged = False
     SHADER = None
     SOFTVIZ_SHADER_FAILED = False
@@ -612,8 +619,11 @@ def _softviz_edit_vg_sk_cache_signature(settings, edit_objs):
     sk_viz = settings.viz_mode == 'SHAPE_KEY'
     sig = [
         settings.viz_mode,
+        # Edit vs object mode read weights from different sources (bmesh vs mesh).
+        bpy.context.mode,
         settings.vgroup_name,
         settings.shape_key_name,
+        settings.material_name,
         _softviz_cage_cache_signature(edit_objs, sk_viz),
     ]
     for obj in edit_objs:
@@ -777,10 +787,6 @@ def draw_callback():
         VIZ_CACHE.edit_vw_list = None
         VIZ_CACHE.edit_vw_sig = None
 
-    if s.viz_mode in ('VERTEX_GROUP', 'SHAPE_KEY', 'MATERIAL') and ctx.mode != 'EDIT_MESH':
-        VIZ_CACHE.edit_vw_list = None
-        VIZ_CACHE.edit_vw_sig = None
-
     sk_viz = s.viz_mode == 'SHAPE_KEY'
     cage_sig = _softviz_cage_cache_signature(edit_objs, sk_viz)
     if mesh_changed or VIZ_CACHE.cage_cache_sig != cage_sig:
@@ -795,7 +801,7 @@ def draw_callback():
     cage_coords_by_obj = VIZ_CACHE.cage_coords_by_obj_cache
 
     vert_weights = None
-    if s.viz_mode in ('VERTEX_GROUP', 'SHAPE_KEY') and ctx.mode == 'EDIT_MESH':
+    if s.viz_mode in ('VERTEX_GROUP', 'SHAPE_KEY', 'MATERIAL'):
         cand_sig = _softviz_edit_vg_sk_cache_signature(s, edit_objs)
         if (not mesh_changed and VIZ_CACHE.edit_vw_sig == cand_sig
                 and VIZ_CACHE.edit_vw_list is not None):
@@ -1110,7 +1116,7 @@ def draw_callback():
             vert_weights = VIZ_CACHE.vert_weights if VIZ_CACHE.vert_weights is not None else []
             if not vert_weights: return
 
-        if s.viz_mode in ('VERTEX_GROUP', 'SHAPE_KEY') and ctx.mode == 'EDIT_MESH':
+        if s.viz_mode in ('VERTEX_GROUP', 'SHAPE_KEY', 'MATERIAL'):
             VIZ_CACHE.edit_vw_list = vert_weights
             VIZ_CACHE.edit_vw_sig = _softviz_edit_vg_sk_cache_signature(s, edit_objs)
 
@@ -1145,19 +1151,31 @@ def draw_callback():
     # colors change - not on every camera move or mode switch.
     if s.viz_mode == 'PROPORTIONAL':
         data_hash = VIZ_CACHE.hash
-        # VIZ_CACHE.hash omits per-vertex coords and is not advanced every modal frame
-        # during the spy session. Fingerprint pos + influence so the batch rebakes on
-        # grab (moved verts), scroll radius (weights change at fixed positions), etc.
-        h_pos = _softviz_blake2b16()
-        for wp, w in vert_weights:
-            _softviz_digest_i32_quad(
-                h_pos,
-                round(wp.x * COORD_HASH_QUANT),
-                round(wp.y * COORD_HASH_QUANT),
-                round(wp.z * COORD_HASH_QUANT),
-                round(w * WEIGHT_HASH_QUANT),
-            )
-        pos_fp = h_pos.digest()
+        if RT.modal_radius is not None:
+            # Drag frames: live positions change every frame, so the batch must
+            # rebuild regardless - a sequence token is cheaper than hashing.
+            VIZ_CACHE.batch_seq += 1
+            pos_fp = ('seq', VIZ_CACHE.batch_seq)
+            VIZ_CACHE.vw_fp = None
+            VIZ_CACHE.vw_fp_list = None
+        elif VIZ_CACHE.vw_fp_list is vert_weights and VIZ_CACHE.vw_fp is not None:
+            # Same cached list as the last redraw - contents can't have changed.
+            pos_fp = VIZ_CACHE.vw_fp
+        else:
+            # VIZ_CACHE.hash omits per-vertex coords. Fingerprint pos + influence so
+            # the batch rebakes when verts moved or weights changed at fixed positions.
+            h_pos = _softviz_blake2b16()
+            for wp, w in vert_weights:
+                _softviz_digest_i32_quad(
+                    h_pos,
+                    round(wp.x * COORD_HASH_QUANT),
+                    round(wp.y * COORD_HASH_QUANT),
+                    round(wp.z * COORD_HASH_QUANT),
+                    round(w * WEIGHT_HASH_QUANT),
+                )
+            pos_fp = h_pos.digest()
+            VIZ_CACHE.vw_fp = pos_fp
+            VIZ_CACHE.vw_fp_list = vert_weights
     else:
         if s.viz_mode == 'VERTEX_GROUP':
             data_hash = ('VG', s.vgroup_name, len(vert_weights))
@@ -1165,15 +1183,20 @@ def draw_callback():
             data_hash = ('MAT', s.material_name, len(vert_weights))
         else:
             data_hash = ('SK', s.shape_key_name, len(vert_weights))
-        h_pos = _softviz_blake2b16()
-        for wp, _ in vert_weights:
-            _softviz_digest_i32_triplet(
-                h_pos,
-                round(wp.x * COORD_HASH_QUANT),
-                round(wp.y * COORD_HASH_QUANT),
-                round(wp.z * COORD_HASH_QUANT),
-            )
-        pos_fp = h_pos.digest()
+        if VIZ_CACHE.vw_fp_list is vert_weights and VIZ_CACHE.vw_fp is not None:
+            pos_fp = VIZ_CACHE.vw_fp
+        else:
+            h_pos = _softviz_blake2b16()
+            for wp, _ in vert_weights:
+                _softviz_digest_i32_triplet(
+                    h_pos,
+                    round(wp.x * COORD_HASH_QUANT),
+                    round(wp.y * COORD_HASH_QUANT),
+                    round(wp.z * COORD_HASH_QUANT),
+                )
+            pos_fp = h_pos.digest()
+            VIZ_CACHE.vw_fp = pos_fp
+            VIZ_CACHE.vw_fp_list = vert_weights
     alpha_fade = 0.3 if s.viz_mode == 'MATERIAL' else s.alpha_fade
     batch_key = (data_hash, pos_fp, VIZ_CACHE.ramp_lut_key, round(alpha_fade, 4))
 

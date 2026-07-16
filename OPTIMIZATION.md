@@ -44,7 +44,7 @@ but topology can't change inside a transform modal, so the invariance holds.
 
 **Expected:** removes ~50–180 ms/frame during drags; the largest single win available.
 
-### 2. Per-point fingerprint hashing on every redraw, even fully idle — HIGH
+### 2. Per-point fingerprint hashing on every redraw, even fully idle — HIGH — *implemented 2026-07-16, pending user testing*
 Batch-key computation (~lines 1100–1130) loops over all `vert_weights` with
 `struct.pack` + blake2b on **every** draw callback — including plain viewport
 orbit/pan frames where the idle cache fast-path (line 765) already proved nothing
@@ -56,7 +56,7 @@ viewport showing the overlay.
 frame anyway — skip hashing entirely and rebuild the batch unconditionally (hashing
 costs about as much as the list build it tries to avoid).
 
-### 3. MATERIAL mode (always) and VG/SK in object mode have no cache at all — HIGH for those modes
+### 3. MATERIAL mode (always) and VG/SK in object mode have no cache at all — HIGH for those modes — *implemented 2026-07-16, pending user testing*
 The signature cache at ~line 1067 only stores VG/SK results in edit mode. MATERIAL
 mode re-walks **all polygons** and VG/SK-in-object-mode re-walk all verts (with
 `vert_world_pos` per vert) on every redraw, forever. Material assignments and weights
