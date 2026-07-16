@@ -949,11 +949,18 @@ def draw_callback():
                 VIZ_CACHE.is_dirty = True
 
             rebuild = False
+            refresh_positions = False
 
             if RT.modal_radius is not None:
-                # Spy-keyed G/R/S session: recalc every frame while dragging/scrolling.
-                rebuild = True
+                # Spy-keyed G/R/S session. The weight solve reads frozen snapshot
+                # positions, so its result only changes when the cache key does
+                # (scroll radius / falloff) - not per drag frame. Live draw
+                # positions do move every frame, so always refresh those.
+                refresh_positions = True
                 VIZ_CACHE.is_dirty = False
+                if current_hash != VIZ_CACHE.hash:
+                    rebuild = True
+                    VIZ_CACHE.hash = current_hash
             elif current_hash != VIZ_CACHE.hash:
                 rebuild = True
                 VIZ_CACHE.hash = current_hash
@@ -1043,7 +1050,7 @@ def draw_callback():
 
                             VIZ_CACHE.weights[obj.name] = obj_weights
 
-            if rebuild:
+            if rebuild or refresh_positions:
                 cached_vw = []
                 for obj in edit_objs:
                     if obj.name not in VIZ_CACHE.weights: continue
