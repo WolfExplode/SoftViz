@@ -1,5 +1,6 @@
 import bpy, bmesh, gpu, heapq, time, traceback
 import array, hashlib, struct
+import numpy as np
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector, kdtree
 
@@ -340,12 +341,14 @@ def softviz_undo_redo_post(scene):
 # -------------------------------------------------
 def softviz_cache_timer():
     scene = bpy.context.scene
-    if scene.softviz_running:
-        if VIZ_CACHE.is_dirty and (time.time() - VIZ_CACHE.last_change_time) > CACHE_DEBOUNCE_SEC:
-            for window in bpy.context.window_manager.windows:
-                for area in window.screen.areas:
-                    if area.type == 'VIEW_3D':
-                        area.tag_redraw()
+    if not scene.softviz_running:
+        # Overlay off: tick slower, nothing to debounce.
+        return 0.5
+    if VIZ_CACHE.is_dirty and (time.time() - VIZ_CACHE.last_change_time) > CACHE_DEBOUNCE_SEC:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
     return 0.1
 
 # -------------------------------------------------
@@ -498,11 +501,16 @@ def topology_edit_display_warning_lines(context):
                 lines.append(f"{obj.name}: {mod.name} ({mod.type})")
     return lines
 
-def proportional_mirror_world_positions(obj, mat, wp, epsilon=MIRROR_POS_EPSILON):
-    """World positions mirrored in object-local space per mesh symmetry flags."""
+def proportional_mirror_world_positions(obj, mat, wp, epsilon=MIRROR_POS_EPSILON, inv=None):
+    """World positions mirrored in object-local space per mesh symmetry flags.
+
+    Pass a precomputed `inv` (mat.inverted()) when calling per vertex - inverting
+    the matrix per call dominates the cost on dense meshes.
+    """
     if not (obj.use_mesh_mirror_x or obj.use_mesh_mirror_y or obj.use_mesh_mirror_z):
         return (wp.copy(),)
-    inv = mat.inverted()
+    if inv is None:
+        inv = mat.inverted()
     local = inv @ wp
     opts_x = (-1.0, 1.0) if obj.use_mesh_mirror_x else (1.0,)
     opts_y = (-1.0, 1.0) if obj.use_mesh_mirror_y else (1.0,)
@@ -727,23 +735,33 @@ def _capture_softviz_transform_snapshot(context):
         snap[obj.name] = {"mw": mw, "coords": coords, "n": n}
     return snap
 
-def _snap_vert_world(snapshot, obj, vert_index, mat, v, cage):
-    """World pos for weight math during modal: snapshot if valid, else live cage pos."""
-    if not snapshot:
-        return vert_world_pos(mat, v, cage)
-    row = snapshot.get(obj.name)
-    if not row:
-        return vert_world_pos(mat, v, cage)
-    n = row["n"]
-    if not (0 <= vert_index < n):
-        return vert_world_pos(mat, v, cage)
+def _softviz_solve_world_positions(snap, obj, bm, mat, cage):
+    """Per-vertex world positions for the weight solve, indexed by vert index.
+
+    Hoists the per-vertex snapshot/dict/matrix work out of the Dijkstra and
+    KD-tree loops (one position fetch per vertex instead of one per edge visit).
+    """
+    bm.verts.ensure_lookup_table()
+    out = [None] * len(bm.verts)
+    row = snap.get(obj.name) if snap else None
+    if row is None:
+        for v in bm.verts:
+            out[v.index] = vert_world_pos(mat, v, cage)
+        return out
     coords = row["coords"]
-    i = vert_index * 3
-    x = coords[i]
-    # NaN means "unset" in snapshot (see _capture_softviz_transform_snapshot).
-    if x != x:
-        return vert_world_pos(mat, v, cage)
-    return row["mw"] @ Vector((x, coords[i + 1], coords[i + 2]))
+    n = row["n"]
+    mw = row["mw"]
+    for v in bm.verts:
+        vi = v.index
+        if vi < n:
+            i3 = vi * 3
+            x = coords[i3]
+            # NaN means "unset" in snapshot (see _capture_softviz_transform_snapshot).
+            if x == x:
+                out[vi] = mw @ Vector((x, coords[i3 + 1], coords[i3 + 2]))
+                continue
+        out[vi] = vert_world_pos(mat, v, cage)
+    return out
 
 # -------------------------------------------------
 # DRAW
@@ -1018,24 +1036,27 @@ def draw_callback():
             if rebuild:
                 VIZ_CACHE.weights.clear()
                 snap = RT.transform_snapshot
+                # Per-vertex RNA reads are slow; resolve once per solve.
+                fall_mode = ts.proportional_edit_falloff
 
+                solve_pos = {}
                 global_centers = []
                 for obj in edit_objs:
                     bm = bms[obj]
                     mat = obj.matrix_world
                     cage = cage_coords_by_obj.get(obj.name)
-                    sel = [v for v in bm.verts if v.select]
-                    for v in sel:
-                        global_centers.append(
-                            _snap_vert_world(snap, obj, v.index, mat, v, cage))
+                    wpos = _softviz_solve_world_positions(snap, obj, bm, mat, cage)
+                    solve_pos[obj.name] = wpos
+                    for v in bm.verts:
+                        if v.select:
+                            global_centers.append(wpos[v.index])
                     VIZ_CACHE.weights[obj.name] = []
 
                 if global_centers:
                     if ts.use_proportional_connected:
                         for obj in edit_objs:
                             bm = bms[obj]
-                            mat = obj.matrix_world
-                            cage = cage_coords_by_obj.get(obj.name)
+                            wpos = solve_pos[obj.name]
                             sel = [v for v in bm.verts if v.select]
                             if not sel: continue
 
@@ -1049,15 +1070,14 @@ def draw_callback():
 
                                 if dist > distances.get(v, float('inf')): continue
 
-                                w = falloff(dist / rad, ts.proportional_edit_falloff)
+                                w = falloff(dist / rad, fall_mode)
                                 if w > 0.0:
                                     obj_weights.append((v.index, w))
 
-                                p_v = _snap_vert_world(snap, obj, v.index, mat, v, cage)
+                                p_v = wpos[v.index]
                                 for edge in v.link_edges:
                                     neighbor = edge.other_vert(v)
-                                    p_n = _snap_vert_world(
-                                        snap, obj, neighbor.index, mat, neighbor, cage)
+                                    p_n = wpos[neighbor.index]
                                     edge_len = (p_v - p_n).length
                                     new_dist = dist + edge_len
 
@@ -1080,16 +1100,15 @@ def draw_callback():
                             if RT.modal_radius is not None:
                                 RT.modal_kd = kd
 
+                        kd_find = kd.find
                         for obj in edit_objs:
                             bm = bms[obj]
-                            mat = obj.matrix_world
-                            cage = cage_coords_by_obj.get(obj.name)
+                            wpos = solve_pos[obj.name]
                             obj_weights = []
                             for v in bm.verts:
-                                wp = _snap_vert_world(snap, obj, v.index, mat, v, cage)
-                                _, _, dist = kd.find(wp)
+                                _, _, dist = kd_find(wpos[v.index])
                                 if dist <= rad:
-                                    w = falloff(dist / rad, ts.proportional_edit_falloff)
+                                    w = falloff(dist / rad, fall_mode)
                                     if w > 0.0:
                                         obj_weights.append((v.index, w))
 
@@ -1103,14 +1122,21 @@ def draw_callback():
                     mat = obj.matrix_world
                     cage = cage_coords_by_obj.get(obj.name)
                     bm.verts.ensure_lookup_table()
+                    verts = bm.verts
+                    n_verts = len(verts)
+                    mirror_any = (obj.use_mesh_mirror_x or obj.use_mesh_mirror_y
+                                  or obj.use_mesh_mirror_z)
+                    mat_inv = mat.inverted() if mirror_any else None
                     for v_idx, w in VIZ_CACHE.weights[obj.name]:
-                        try:
-                            v = bm.verts[v_idx]
-                            wp = vert_world_pos(mat, v, cage)
-                            for wp_sym in proportional_mirror_world_positions(obj, mat, wp):
+                        if not (0 <= v_idx < n_verts):
+                            continue
+                        wp = vert_world_pos(mat, verts[v_idx], cage)
+                        if mirror_any:
+                            for wp_sym in proportional_mirror_world_positions(
+                                    obj, mat, wp, inv=mat_inv):
                                 cached_vw.append((wp_sym, w))
-                        except IndexError:
-                            pass
+                        else:
+                            cached_vw.append((wp, w))
                 VIZ_CACHE.vert_weights = cached_vw
 
             vert_weights = VIZ_CACHE.vert_weights if VIZ_CACHE.vert_weights is not None else []
@@ -1201,35 +1227,40 @@ def draw_callback():
     batch_key = (data_hash, pos_fp, VIZ_CACHE.ramp_lut_key, round(alpha_fade, 4))
 
     if VIZ_CACHE.batch is None or VIZ_CACHE.batch_hash != batch_key:
-        positions = []
-        corner_list = []
-        color_list = []
-        indices = []
-        vc = 0
-        for wp, w in vert_weights:
-            if lut is not None:
-                r, g, b, a = lut[min(255, int(w * 255))]
-            else:
-                r, g, b, a = (1.0, 0.0, 0.0, 1.0)
-            if s.viz_mode == 'MATERIAL':
-                a = 0.0
-            a = (a * (1.0 - alpha_fade)) + (w * alpha_fade)
-            col = (r, g, b, a)
+        n_pts = len(vert_weights)
+        if not n_pts: return
 
-            p = (wp.x, wp.y, wp.z)
-            positions.extend([p, p, p, p])
-            corner_list.extend(_QUAD_CORNERS)
-            color_list.extend([col, col, col, col])
-            indices.extend([(vc, vc + 1, vc + 2), (vc, vc + 2, vc + 3)])
-            vc += 4
+        # Vectorized quad expansion: ~10x faster than building 4x-duplicated
+        # Python lists per point; batch_for_shader accepts numpy arrays directly.
+        centers = np.array(
+            [wp.to_tuple() for wp, _ in vert_weights], dtype=np.float32)
+        ws = np.fromiter(
+            (w for _, w in vert_weights), dtype=np.float32, count=n_pts)
 
-        if not positions: return
+        if lut is not None:
+            lut_np = np.asarray(lut, dtype=np.float32)
+            cols = lut_np[np.clip((ws * 255.0).astype(np.int32), 0, 255)]
+        else:
+            cols = np.tile(
+                np.array((1.0, 0.0, 0.0, 1.0), dtype=np.float32), (n_pts, 1))
+        if s.viz_mode == 'MATERIAL':
+            cols[:, 3] = 0.0
+        cols[:, 3] = cols[:, 3] * (1.0 - alpha_fade) + ws * alpha_fade
+
+        positions = np.repeat(centers, 4, axis=0)
+        corner_arr = np.tile(
+            np.array(_QUAD_CORNERS, dtype=np.float32), (n_pts, 1))
+        color_arr = np.repeat(cols, 4, axis=0)
+        base = np.arange(n_pts, dtype=np.uint32) * 4
+        tris = np.empty((n_pts * 2, 3), dtype=np.uint32)
+        tris[0::2] = np.stack([base, base + 1, base + 2], axis=1)
+        tris[1::2] = np.stack([base, base + 2, base + 3], axis=1)
 
         try:
             VIZ_CACHE.batch = batch_for_shader(
                 SHADER, 'TRIS',
-                {"pos": positions, "corner": corner_list, "color": color_list},
-                indices=indices,
+                {"pos": positions, "corner": corner_arr, "color": color_arr},
+                indices=tris,
             )
             VIZ_CACHE.batch_hash = batch_key
         except Exception as ex:

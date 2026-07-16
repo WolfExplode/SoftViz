@@ -1,5 +1,8 @@
 # Optimization findings (2026-07-16)
 
+**Status: all findings below implemented and user-tested 2026-07-16. Plugin behavior
+confirmed unchanged in-editor after the full pass.**
+
 Second-opinion performance review of `__init__.py` (v1.5.0). Hot-path patterns were
 micro-benchmarked inside Blender 5.1.0 (numpy 2.3.4) with synthetic data:
 N = 100k verts, S = 200 selected seeds, K = 20k weighted overlay points.
@@ -28,7 +31,7 @@ mode) on work whose result is identical to the previous frame.
 
 ## Findings, ranked by impact
 
-### 1. Weight solve reruns every modal frame though it's drag-invariant — HIGH — *implemented 2026-07-16, pending user testing*
+### 1. Weight solve reruns every modal frame though it's drag-invariant — HIGH — *implemented 2026-07-16, user-tested OK*
 `draw_callback` (~line 953): `if RT.modal_radius is not None: rebuild = True` forces a
 full Dijkstra/KD weight solve every frame of the spy session. But the solve reads
 positions via `_snap_vert_world`, i.e. the **frozen transform snapshot**, and the
@@ -44,7 +47,7 @@ but topology can't change inside a transform modal, so the invariance holds.
 
 **Expected:** removes ~50–180 ms/frame during drags; the largest single win available.
 
-### 2. Per-point fingerprint hashing on every redraw, even fully idle — HIGH — *implemented 2026-07-16, pending user testing*
+### 2. Per-point fingerprint hashing on every redraw, even fully idle — HIGH — *implemented 2026-07-16, user-tested OK*
 Batch-key computation (~lines 1100–1130) loops over all `vert_weights` with
 `struct.pack` + blake2b on **every** draw callback — including plain viewport
 orbit/pan frames where the idle cache fast-path (line 765) already proved nothing
@@ -56,7 +59,7 @@ viewport showing the overlay.
 frame anyway — skip hashing entirely and rebuild the batch unconditionally (hashing
 costs about as much as the list build it tries to avoid).
 
-### 3. MATERIAL mode (always) and VG/SK in object mode have no cache at all — HIGH for those modes — *implemented 2026-07-16, pending user testing*
+### 3. MATERIAL mode (always) and VG/SK in object mode have no cache at all — HIGH for those modes — *implemented 2026-07-16, user-tested OK*
 The signature cache at ~line 1067 only stores VG/SK results in edit mode. MATERIAL
 mode re-walks **all polygons** and VG/SK-in-object-mode re-walk all verts (with
 `vert_world_pos` per vert) on every redraw, forever. Material assignments and weights
@@ -66,7 +69,7 @@ rarely change frame-to-frame.
 and to VG/SK outside edit mode (signature: object name, matrix fingerprint, material
 name/slot or group name, mesh vert/poly counts, `mesh_eval_dirty`).
 
-### 4. Per-vertex Python math instead of per-object precompute — MEDIUM-HIGH
+### 4. Per-vertex Python math instead of per-object precompute — MEDIUM-HIGH — *implemented 2026-07-16 (precomputed position lists; numpy variant not needed), user-tested OK*
 `_snap_vert_world` / `vert_world_pos` are called once per vertex (KD branch) or twice
 per edge visit (Dijkstra branch). Each call does dict lookups, bounds checks, a
 `Vector` allocation, and a Python-level `Matrix @ Vector`.
@@ -81,20 +84,20 @@ Note: naive numpy brute-force distance-to-seeds measured **worse** than
 `mathutils.kdtree` (~400 ms vs ~52 ms at 200 seeds) — keep the KD-tree for the
 search, feed it precomputed coords.
 
-### 5. `proportional_mirror_world_positions` inverts the matrix per weighted vertex — MEDIUM
+### 5. `proportional_mirror_world_positions` inverts the matrix per weighted vertex — MEDIUM — *implemented 2026-07-16, user-tested OK*
 Called per weighted vertex (~line 1058); when any mirror flag is set it runs
 `mat.inverted()` **per call** (line 460). Hoist the inverse (and the no-mirror check)
 per object, outside the vertex loop. Also: the no-mirror early-out returns
 `(wp.copy(),)` — an allocation per vertex that callers don't need, since `wp` is
 freshly computed each iteration.
 
-### 6. Batch geometry built as 4×-duplicated Python lists — LOW-MEDIUM
+### 6. Batch geometry built as 4×-duplicated Python lists — LOW-MEDIUM — *implemented 2026-07-16 (numpy build verified equivalent in-Blender), user-tested OK*
 ~15 ms per batch rebuild at 20k points (lines 1139–1155). Only matters when the batch
 rebuilds — but with finding 1/2 unfixed that's every modal frame. numpy
 (`np.repeat` for positions/colors, `np.tile` for corners, arange-based index array)
 cuts this to ~1 ms, and `batch_for_shader` accepts numpy arrays directly.
 
-### 7. Micro / hygiene — LOW
+### 7. Micro / hygiene — LOW — *falloff-mode hoist and idle-timer slowdown implemented and user-tested 2026-07-16; premultiplied LUT superseded by the numpy color path in finding 6*
 - `falloff()` re-branches on the mode string per vertex; resolving the falloff mode
   to a local function once per solve shaves a bit in both branches.
 - The LUT lookup `lut[min(255, int(w*255))]` and per-point alpha math could be folded
@@ -116,11 +119,16 @@ cuts this to ~1 ms, and `batch_for_shader` accepts numpy arrays directly.
 - **One draw callback per 3D viewport region** — Blender's handler model; caches are
   shared, so extra viewports mostly pay only the (post-fix) cheap path.
 
-## Suggested order of work
+## Work log
 
-1. Finding 1 (drag-invariant weights) — biggest win, self-contained in the
-   PROPORTIONAL rebuild block.
-2. Finding 2 (fingerprint caching) — small diff, fixes idle-orbit cost.
-3. Finding 3 (MATERIAL / object-mode caching) — reuses the existing signature pattern.
-4. Findings 4–6 (numpy precompute + batch build) — larger diff, do after 1–3 so the
-   remaining per-frame path is the only thing left to vectorize.
+All findings (1–6, plus the two cheap parts of 7) were implemented in `__init__.py`
+on 2026-07-16, in the order originally suggested (1 → 2 → 3 → 4–6). Each stage was
+compile-checked with `py_compile`; the numpy batch-geometry rewrite (finding 6) was
+additionally verified inside a live Blender session to produce output identical to
+the old list-based build (position/corner/index arrays exact, color channel within
+float32 rounding, ~3e-8 max error). The user then tested the add-on directly in
+Blender across the PROPORTIONAL/VERTEX_GROUP/SHAPE_KEY/MATERIAL modes, G/R/S drags
+with scroll, mirror symmetry, and idle viewport orbiting, and confirmed the plugin
+behaves the same as before the optimization pass.
+
+No further action items remain from this review.
