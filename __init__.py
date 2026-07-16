@@ -50,13 +50,25 @@ MIRROR_POS_EPSILON = 1e-4
 class SoftVizRuntime:
     """Modal spy and keymap state in one place (avoids scattered _SV_* globals)."""
 
-    __slots__ = ("modal_radius", "transform_snapshot", "modal_kd", "spy_keymaps")
+    __slots__ = ("modal_radius", "transform_snapshot", "modal_kd", "spy_keymaps",
+                 "modal_key_names", "modal_obj_key_elems", "modal_sel_by_obj")
 
     def __init__(self):
         self.modal_radius = None
         self.transform_snapshot = None
         self.modal_kd = None
         self.spy_keymaps = []
+        # Per-drag-session caches: selection / topology / object matrices can't
+        # change inside a transform modal, so the O(verts) bmesh scans that feed
+        # the proportional cache key run once per G/R/S session, not per frame.
+        self.modal_key_names = None
+        self.modal_obj_key_elems = None
+        self.modal_sel_by_obj = None
+
+    def clear_modal_session(self):
+        self.modal_key_names = None
+        self.modal_obj_key_elems = None
+        self.modal_sel_by_obj = None
 
 
 RT = SoftVizRuntime()
@@ -538,10 +550,16 @@ def eval_vert_world_coords(obj, depsgraph, expected_vert_count):
             traceback.print_exc()
         return None
     try:
-        if len(me.vertices) != expected_vert_count:
+        n = len(me.vertices)
+        if n != expected_vert_count:
             return None
-        mw = eval_obj.matrix_world
-        return [mw @ me.vertices[i].co.copy() for i in range(len(me.vertices))]
+        # Bulk-read + numpy transform: the per-vert Python `mw @ co` loop this
+        # replaces dominated cage refresh cost on dense meshes during drags.
+        buf = np.empty(n * 3, dtype=np.float32)
+        me.vertices.foreach_get("co", buf)
+        m = np.array(eval_obj.matrix_world, dtype=np.float64)
+        world = buf.reshape(n, 3) @ m[:3, :3].T + m[:3, 3]
+        return [Vector(t) for t in world.tolist()]
     finally:
         eval_obj.to_mesh_clear()
 
@@ -718,20 +736,33 @@ def _capture_softviz_transform_snapshot(context):
     for obj in edit_objs:
         bm = bmesh.from_edit_mesh(obj.data)
         mw = obj.matrix_world.copy()
-        mw_inv = mw.inverted()
         cage = cage_coords_by_obj.get(obj.name)
         n = len(obj.data.vertices)
         # Flat array of local coords (x,y,z)*n; NaN means "unset".
         coords = array.array('f', [float('nan')]) * (n * 3)
-        bm.verts.ensure_lookup_table()
-        for v in bm.verts:
-            if v.index < n:
-                wp = vert_world_pos(mw, v, cage)
-                lp = mw_inv @ wp
-                i = v.index * 3
-                coords[i] = float(lp.x)
-                coords[i + 1] = float(lp.y)
-                coords[i + 2] = float(lp.z)
+        if cage is not None:
+            # Cage coords are world-space and dense over 0..n-1, so no bmesh walk:
+            # one inverse transform per vert instead of world+inverse via bmesh.
+            # Indices past len(cage) stay NaN -> solver falls back to live position,
+            # matching the old vert_world_pos fallback.
+            mw_inv = mw.inverted()
+            for vi in range(min(n, len(cage))):
+                lp = mw_inv @ cage[vi]
+                i = vi * 3
+                coords[i] = lp.x
+                coords[i + 1] = lp.y
+                coords[i + 2] = lp.z
+        else:
+            # No cage: world -> local round-trips back to v.co, so store it directly.
+            bm.verts.ensure_lookup_table()
+            for v in bm.verts:
+                vi = v.index
+                if vi < n:
+                    co = v.co
+                    i = vi * 3
+                    coords[i] = co.x
+                    coords[i + 1] = co.y
+                    coords[i + 2] = co.z
         snap[obj.name] = {"mw": mw, "coords": coords, "n": n}
     return snap
 
@@ -982,34 +1013,60 @@ def draw_callback():
             # ts.proportional_size is stale inside the modal until the operator exits.
             rad = RT.modal_radius if (RT.modal_radius is not None) else ts.proportional_size
 
-            cache_key_elements = _softviz_proportional_cache_key_elements(
-                ts, edit_objs, bms, None)
-            current_hash = tuple(cache_key_elements)
-            VIZ_CACHE.prop_sel_by_obj = {
-                obj.name: tuple(v.index for v in bms[obj].verts if v.select)
-                for obj in edit_objs
-            }
+            if RT.modal_radius is not None:
+                # Drag session: selection / topology / object matrices are frozen,
+                # so run the O(verts) key-element scan once and reuse its per-object
+                # tail every frame. Radius / falloff / connected CAN change mid-drag
+                # (scroll, Shift+O, Alt+O), so those stay live in the key head.
+                names = tuple(obj.name for obj in edit_objs)
+                if RT.modal_obj_key_elems is None or RT.modal_key_names != names:
+                    elems = _softviz_proportional_cache_key_elements(
+                        ts, edit_objs, bms, None)
+                    RT.modal_obj_key_elems = tuple(elems[3:])
+                    RT.modal_key_names = names
+                    RT.modal_sel_by_obj = {
+                        obj.name: tuple(v.index for v in bms[obj].verts if v.select)
+                        for obj in edit_objs
+                    }
+                cache_key_elements = [
+                    rad,
+                    ts.proportional_edit_falloff,
+                    ts.use_proportional_connected,
+                ]
+                cache_key_elements.extend(RT.modal_obj_key_elems)
+                current_hash = tuple(cache_key_elements)
+                VIZ_CACHE.prop_sel_by_obj = RT.modal_sel_by_obj
+                # No coord hash during the modal: is_dirty is forced off below and
+                # the spy's end handler invalidates coord_hash for the final solve.
+            else:
+                cache_key_elements = _softviz_proportional_cache_key_elements(
+                    ts, edit_objs, bms, None)
+                current_hash = tuple(cache_key_elements)
+                VIZ_CACHE.prop_sel_by_obj = {
+                    obj.name: tuple(v.index for v in bms[obj].verts if v.select)
+                    for obj in edit_objs
+                }
 
-            h_coords = _softviz_blake2b16()
-            for obj in edit_objs:
-                bm = bms[obj]
-                mat = obj.matrix_world
-                cage = cage_coords_by_obj.get(obj.name)
-                for v in bm.verts:
-                    if v.select:
-                        wp = vert_world_pos(mat, v, cage)
-                        _softviz_digest_i32_triplet(
-                            h_coords,
-                            round(wp.x * COORD_HASH_QUANT),
-                            round(wp.y * COORD_HASH_QUANT),
-                            round(wp.z * COORD_HASH_QUANT),
-                        )
-            current_coord_hash = h_coords.digest()
+                h_coords = _softviz_blake2b16()
+                for obj in edit_objs:
+                    bm = bms[obj]
+                    mat = obj.matrix_world
+                    cage = cage_coords_by_obj.get(obj.name)
+                    for v in bm.verts:
+                        if v.select:
+                            wp = vert_world_pos(mat, v, cage)
+                            _softviz_digest_i32_triplet(
+                                h_coords,
+                                round(wp.x * COORD_HASH_QUANT),
+                                round(wp.y * COORD_HASH_QUANT),
+                                round(wp.z * COORD_HASH_QUANT),
+                            )
+                current_coord_hash = h_coords.digest()
 
-            if current_coord_hash != VIZ_CACHE.coord_hash:
-                VIZ_CACHE.coord_hash = current_coord_hash
-                VIZ_CACHE.last_change_time = time.time()
-                VIZ_CACHE.is_dirty = True
+                if current_coord_hash != VIZ_CACHE.coord_hash:
+                    VIZ_CACHE.coord_hash = current_coord_hash
+                    VIZ_CACHE.last_change_time = time.time()
+                    VIZ_CACHE.is_dirty = True
 
             rebuild = False
             refresh_positions = False
@@ -1144,7 +1201,9 @@ def draw_callback():
 
         if s.viz_mode in ('VERTEX_GROUP', 'SHAPE_KEY', 'MATERIAL'):
             VIZ_CACHE.edit_vw_list = vert_weights
-            VIZ_CACHE.edit_vw_sig = _softviz_edit_vg_sk_cache_signature(s, edit_objs)
+            # cand_sig from the cache check above is still valid: nothing between
+            # there and here mutates object/modifier state (cage eval restores it).
+            VIZ_CACHE.edit_vw_sig = cand_sig
 
     global SHADER, SOFTVIZ_SHADER_FAILED
     if SHADER is None and not SOFTVIZ_SHADER_FAILED:
@@ -1391,6 +1450,7 @@ class VIEW3D_OT_softviz_transform_spy(bpy.types.Operator):
             return {'CANCELLED'} if 'CANCELLED' in result else {'FINISHED'}
         snap = _capture_softviz_transform_snapshot(context)
         RT.modal_kd = None
+        RT.clear_modal_session()
         result = _TRANSFORM_OPS[self.transform_type]()
         # If nothing was selected / transform cancelled immediately, don't go modal.
         if 'RUNNING_MODAL' not in result and 'FINISHED' not in result:
@@ -1413,6 +1473,7 @@ class VIEW3D_OT_softviz_transform_spy(bpy.types.Operator):
             RT.modal_radius = None
             RT.transform_snapshot = None
             RT.modal_kd = None
+            RT.clear_modal_session()
             # Weights were solved against the start-of-drag snapshot, but the cache
             # key omits vertex coords and is_dirty was suppressed during the modal,
             # so nothing re-solves at the committed positions. Force a fresh solve.
@@ -1517,16 +1578,17 @@ class VIEW3D_PT_softviz(bpy.types.Panel):
             warn = topology_edit_display_warning_lines(context)
             if warn:
                 box = l.box()
-                box.alert = True
                 box.label(
-                    text='Topology modifier uses "Display Modifier in Edit Mode":',
+                    text='Topology modifier displayed in Edit Mode:',
                     icon='INFO',
                 )
                 for line in warn[:6]:
                     box.label(text=line)
                 if len(warn) > 6:
                     box.label(text=f"... +{len(warn) - 6} more")
-                box.label(text="SoftViz cannot match subdiv/cage verts to mesh indices.")
+                box.label(text="Heatmap follows the base mesh, ignoring")
+                box.label(text="these modifiers - dots may sit slightly")
+                box.label(text="off the displayed (e.g. subdivided) surface.")
 
 
 class VIEW3D_PT_softviz_display(bpy.types.Panel):

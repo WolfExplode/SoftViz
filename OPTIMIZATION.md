@@ -132,3 +132,49 @@ with scroll, mirror symmetry, and idle viewport orbiting, and confirmed the plug
 behaves the same as before the optimization pass.
 
 No further action items remain from this review.
+
+# Second pass (2026-07-16) — smaller residual wins
+
+**Status: implemented and user-tested in Blender 2026-07-16. Behavior unchanged;
+no noticeable performance improvement observed.** Kept in anyway — the changes
+remove real per-frame work, but after the first pass the frame budget is dominated
+elsewhere, so any gain is below perceptual/measurement noise at tested mesh sizes.
+Treat this as the practical ceiling for Python-side optimization: further gains
+would require moving the weight solve off Python (compute shader / geometry nodes),
+i.e. a rewrite, not an optimization.
+
+### A. Modal drag frames no longer do O(all verts) selection scans
+During a spy G/R/S session, every draw frame ran `_softviz_proportional_cache_key_elements`
+with live bmeshes (full vert scan per object), rebuilt `prop_sel_by_obj` (second full
+scan), and hashed selected world coords into `coord_hash` (third scan + blake2b).
+Selection, topology, and object matrices cannot change inside a transform modal, so
+the per-object key-element tail and selection dict are now captured once per drag
+session (`RT.modal_obj_key_elems` / `RT.modal_sel_by_obj`, cleared in spy invoke and
+end handler). Radius / falloff / connected stay live in the key head since scroll,
+Shift+O, and Alt+O can change them mid-drag. The coord hash is skipped entirely
+during the modal — `is_dirty` was force-cleared each modal frame anyway, and the spy
+end handler nulls `coord_hash` to force the post-commit re-solve.
+
+### B. Cage evaluation transforms coords in numpy
+`eval_vert_world_coords` did `mw @ me.vertices[i].co.copy()` per vertex in Python;
+it runs every drag frame for objects needing a deform cage (armature / shape keys).
+Now `foreach_get("co")` + one numpy matmul, converted back to a `Vector` list (the
+Vector construction is now the dominant remaining cost; callers still expect Vectors).
+
+### C. Snapshot capture at G/R/S start avoids redundant matrix math
+`_capture_softviz_transform_snapshot` stored local coords but computed them as
+`mw_inv @ (mw @ v.co)` per vertex. No-cage case now stores `v.co` directly (zero
+matrix ops); cage case iterates the dense world-space cage list with a single
+inverse transform per vert and no bmesh walk. Indices past `len(cage)` stay NaN,
+preserving the old live-position fallback. Shrinks the keypress hitch on dense meshes.
+
+### D. Micro: VG/SK/MATERIAL signature reuse
+On a cache miss, `_softviz_edit_vg_sk_cache_signature` was computed twice (check +
+store). The stored value now reuses `cand_sig` from the check; nothing between the
+two points mutates object/modifier state (cage eval restores visibility flags).
+
+**Testing (2026-07-16):** user exercised the add-on in Blender and confirmed
+behavior is unchanged, with no noticeable speed difference. Findings A–D stay in
+as they are strictly-less-work rewrites of the same logic, but this file should
+not motivate further passes of this kind: remaining Python-side hot-path work is
+either already cached out or inherently per-frame and small.
