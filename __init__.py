@@ -1382,6 +1382,16 @@ class VIEW3D_OT_softviz_transform_spy(bpy.types.Operator):
             RT.modal_radius = None
             RT.transform_snapshot = None
             RT.modal_kd = None
+            # Weights were solved against the start-of-drag snapshot, but the cache
+            # key omits vertex coords and is_dirty was suppressed during the modal,
+            # so nothing re-solves at the committed positions. Force a fresh solve.
+            VIZ_CACHE.hash = None
+            VIZ_CACHE.coord_hash = None
+            VIZ_CACHE.is_dirty = False
+            for window in context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        area.tag_redraw()
             return {'FINISHED'}
 
         # Detect confirm / cancel events; let transform consume them too.
