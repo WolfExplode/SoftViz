@@ -289,6 +289,45 @@ def softviz_depsgraph_update_post(scene, depsgraph):
                 VIZ_CACHE.mesh_eval_dirty = True
                 return
 
+def _softviz_invalidate_heatmap_caches():
+    """Drop everything derived from mesh state so the next draw rebuilds from scratch."""
+    VIZ_CACHE.mesh_eval_dirty = True
+    VIZ_CACHE.hash = None
+    VIZ_CACHE.coord_hash = None
+    VIZ_CACHE.is_dirty = False
+    VIZ_CACHE.weights.clear()
+    VIZ_CACHE.vert_weights = None
+    VIZ_CACHE.batch = None
+    VIZ_CACHE.batch_hash = None
+    VIZ_CACHE.cage_cache_sig = None
+    VIZ_CACHE.cage_coords_by_obj_cache = {}
+    VIZ_CACHE.edit_vw_list = None
+    VIZ_CACHE.edit_vw_sig = None
+    VIZ_CACHE.prop_sel_by_obj = {}
+
+@bpy.app.handlers.persistent
+def softviz_undo_redo_post(scene):
+    """Undo/redo restores mesh data without reliably firing depsgraph_update_post,
+    so cache fingerprints (selection/counts only, no coords) would keep serving
+    stale heatmap positions. Invalidate everything and redraw."""
+    global DRAW_HANDLE
+    scenes = _bpy_scenes()
+    if scenes is None:
+        return
+    any_on = any(s.softviz_running for s in scenes)
+    # softviz_running is a scene property, so undo can flip it; resync the handler.
+    if any_on != (DRAW_HANDLE is not None):
+        sync_softviz_draw_handler()
+    if not any_on:
+        return
+    _softviz_invalidate_heatmap_caches()
+    wm = getattr(bpy.context, "window_manager", None)
+    if wm is not None:
+        for window in wm.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+
 # -------------------------------------------------
 # DEBOUNCE TIMER
 # -------------------------------------------------
@@ -1537,7 +1576,9 @@ def register():
 
     bpy.app.handlers.load_post.append(softviz_load_post)
     bpy.app.handlers.depsgraph_update_post.append(softviz_depsgraph_update_post)
-    
+    bpy.app.handlers.undo_post.append(softviz_undo_redo_post)
+    bpy.app.handlers.redo_post.append(softviz_undo_redo_post)
+
     if not bpy.app.timers.is_registered(init_nodegroup_timer):
         bpy.app.timers.register(init_nodegroup_timer, first_interval=0.1)
         
@@ -1561,7 +1602,13 @@ def unregister():
 
     if softviz_depsgraph_update_post in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(softviz_depsgraph_update_post)
-        
+
+    if softviz_undo_redo_post in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.remove(softviz_undo_redo_post)
+
+    if softviz_undo_redo_post in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.remove(softviz_undo_redo_post)
+
     if bpy.app.timers.is_registered(init_nodegroup_timer):
         bpy.app.timers.unregister(init_nodegroup_timer)
         
